@@ -75,31 +75,28 @@ def solve_ivp_discrete(model,x0,switches,tf,t_plot):
 
     # Loop through all regimes
     for i in range(len(switches_ext)-1):
-        #print("i")
-        #print(i)
+
 
         if (t_plot is None): 
 
             t_eval = None
         else:
 
-            t_eval = t_plot[ (switches_ext[i] < t_plot) & (t_plot < switches_ext[i+1])]
-            if (len(t_eval) == 0): t_eval = None
+            t_eval = t_plot[ (switches_ext[i] <= t_plot) & (t_plot < switches_ext[i+1])]
+            if (len(t_eval) != 0):
 
-
-
-        sol = solve_ivp(model.f, 
+                sol = solve_ivp(model.f, 
                         [switches_ext[i], 
                          switches_ext[i+1]], 
                         start, 
                         args=(tau_MELT_all,tau_IDLE_all), 
                         t_eval = t_eval)
 
-        T = np.concatenate((T,sol.t))
-        X = np.hstack([X,sol.y])
+                T = np.concatenate((T,sol.t))
+                X = np.hstack([X,sol.y])
 
 
-        start = [sol.y[i][-1] for i in range(nx) ]
+                start = [sol.y[j][-1] for j in range(nx) ]
 
 
     X = np.array([X[i][1:] for i in range(nx)])
@@ -123,7 +120,7 @@ def sol_ivp_wrapper(model,x0,switches,tf,t_plot):
 
 # ENERGY COST
 def smooth_dap(dap,t):
-    dat = 60 * np.array(range(dap.size + 1)); dat[0] = dat[0] - 60; dat[-1] = dat[-1] + 60
+    dat = 60 * np.arange(dap.size + 1); dat[0] = dat[0] - 60; dat[-1] = dat[-1] + 60
     
     _dap = 0
     for k in range(24):
@@ -140,3 +137,21 @@ def smooth_regime(T,switches):
                              (1 + np.exp( np.minimum(1. * (T - tau_IDLE[k]), 15.))))
             
     return regime
+
+
+def cost(traj,T,switches,dap,k,k_MELT,k_IDLE):
+    
+    
+    dt = np.diff(T)
+    regime = smooth_regime(T,switches)
+    _dap = smooth_dap(dap,T)
+    cost_momental = _dap * (k * traj + k_IDLE * (regime <= 0.5) + k_MELT * (regime > 0.5))
+    cost_acc = np.cumsum(cost_momental[1:] * dt)
+
+    #plt.plot(cost_momental)
+    return cost_momental, cost_acc
+
+
+# MATH
+def sigmoid(x,slope,offset):
+    return 1./(1. + np.exp(-(slope * (x - offset))))
