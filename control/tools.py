@@ -48,8 +48,101 @@ def stochasticSimulation(model,switches,x0,tf,dt):
     return np.squeeze(T), np.squeeze(X), np.squeeze(Y), np.squeeze(Z)
 
 
+def simulate_MPC(model,x0,n_days,nswitches,prices,k,k_MELT,k_IDLE,dt,start_date,seed,save_to_file):   
+    np.random.seed(seed)
 
-def derive_regimes(switches,T,endpoints):
+    # Simulate parameters
+    #n_days = 30
+    #dt = 0.01
+    #start_date = '01-08-2013'
+
+    # Initialize process
+    #x0 = np.array([2.6659426, 899.8884004])
+    nx = x0.shape[0]
+    
+    tf_ph = 48 * 60
+    tf_sim = 24 * 60
+
+    # Initialzie history
+    history = {}
+    history['X'] = np.zeros([n_days, nx, 60 * 24])
+    history['Z'] = np.zeros([n_days, 60 * 24])
+    history['Z_ode'] = np.zeros([n_days, 60 * 24])
+    history['T'] = np.zeros([n_days, 60 * 24])
+
+    history['SWITCHES'] = np.zeros([n_days, nswitches])
+    history['PRICES'] = np.zeros([n_days, 48])
+
+    history['expected_price'] = np.zeros(n_days)
+    history['true_price'] = np.zeros(n_days)
+
+
+    idx_offset = np.where(prices.index == start_date)[0][0]
+    for day in range(n_days):
+        print('Simulating day ' + str(day))
+
+        # Extract variables related to the day
+        idx = np.arange(48) + day * 48 + idx_offset
+        future_days = np.array(prices.index[idx])
+        future_hours = np.array(prices['Hours'][idx])
+        future_price = np.array(prices['DK1'][idx]).astype(np.float)
+
+
+        # ---------------------------
+        # Compute optimal switches over 2 days
+        # ---------------------------
+
+        # To be changed to C++ optimizer
+        switch_opt = np.sort(np.random.uniform(0,tf_ph,nswitches))
+
+
+        # ---------------------------
+        # Simulate 1 day
+        # ---------------------------
+        switch_sim = switch_opt
+        #nswicthes_switches_in_ph = np.sum(switch_opt < tf_sim) + np.sum(switch_opt < tf_sim) % 2
+        #switch_sim = switch_opt[switch_opt < tf_sim]
+
+        # Consider only saving every 1 minutes of the simulation
+        T_tmp, X_tmp, Y_tmp, Z_tmp = stochasticSimulation(model,switch_sim,x0,tf_sim,dt)
+        T_tmp_ode, X_tmp_ode, Z_tmp_ode = solve_ivp_discrete(model,x0,switch_sim,tf_sim,T_tmp)
+
+
+        # ---------------------------
+        # Compute Cost
+        # ---------------------------
+        dap = 1/1000000 * future_price[:24]
+        cost_true, cost_acc_true = cost(Z_tmp,T_tmp,switch_sim,dap,k,k_MELT,k_IDLE)
+        cost_exp, cost_acc_exp = cost(Z_tmp_ode,T_tmp_ode,switch_sim,dap,k,k_MELT,k_IDLE)
+
+
+
+        # ---------------------------
+        # Update variables
+        # ---------------------------
+
+        # Process
+        x0 = np.array([X_tmp[i][-1] for i in range(nx)])
+
+        # Update monitored variables
+        history['expected_price'][day] = cost_true[-1]
+        history['true_price'][day] = cost_exp[-1]
+
+        history['Z'][day] = Z_tmp[::int(1/dt)]
+        history['Z_ode'][day] = Z_tmp_ode[::int(1/dt)]
+        history['X'][day,:] = X_tmp[:,::int(1/dt)]
+        history['T'][day] = T_tmp[::int(1/dt)] # Same in each day
+        history['SWITCHES'][day,:] = switch_opt
+        history['PRICES'][day,:] = future_price
+
+    filenname = 'results/sim_history/history_' + start_date + '_' + str(n_days) + '_days' + '_seed_' + str(seed) + '.npy'
+    np.save(filenname,history)
+    
+    return history
+
+
+
+def derive_regimes(switches,tf,endpoints):
     n_switches = switches.size
     n_cycles = int(n_switches/2)
     tau_MELT = switches[np.arange(0,n_switches,2)]
@@ -57,7 +150,7 @@ def derive_regimes(switches,T,endpoints):
     
     if endpoints:
         tau_IDLE = np.insert(tau_IDLE,0,0)
-        tau_MELT = np.append(tau_MELT,T)
+        tau_MELT = np.append(tau_MELT,tf)
     
     return tau_IDLE, tau_MELT
 
@@ -130,7 +223,7 @@ def smooth_dap(dap,t):
 
 
 def smooth_regime(T,switches):
-    tau_IDLE, tau_MELT = derive_regimes(switches,T,0)
+    tau_IDLE, tau_MELT = derive_regimes(switches,T[-1],0)
     regime = 0
     for k in range(len(tau_MELT)):
             regime += 1/ ((1 + np.exp(np.minimum(-1. * (T - tau_MELT[k]), 15.0 ))) *
