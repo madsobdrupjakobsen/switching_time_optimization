@@ -4,7 +4,7 @@ from scipy.integrate import solve_ivp
 def stochasticSimulation(model,switches,x0,tf,dt):
     
     # Compute regimes
-    tau_IDLE_all, tau_MELT_all = derive_regimes(switches,tf,1)
+    tau_MELT_all, tau_IDLE_all = derive_regimes(switches,tf,1)
     
     # Model functions
     f = model.f
@@ -135,31 +135,23 @@ def simulate_MPC(model,x0,n_days,nswitches,prices,k,k_MELT,k_IDLE,dt,start_date,
         history['SWITCHES'][day,:] = switch_opt
         history['PRICES'][day,:] = future_price
 
-    filenname = 'results/sim_history/history_' + start_date + '_' + str(n_days) + '_days' + '_seed_' + str(seed) + '.npy'
+    filenname = '../results/sim_history/history_' + start_date + '_' + str(n_days) + '_days' + '_seed_' + str(seed) + '.npy'
     np.save(filenname,history)
     
     return history
 
 
 
-def derive_regimes(switches,tf,endpoints):
-    n_switches = switches.size
-    n_cycles = int(n_switches/2)
-    tau_MELT = switches[np.arange(0,n_switches,2)]
-    tau_IDLE = switches[np.arange(1,n_switches,2)]
-    
-    if endpoints:
-        tau_IDLE = np.insert(tau_IDLE,0,0)
-        tau_MELT = np.append(tau_MELT,tf)
-    
-    return tau_IDLE, tau_MELT
 
 def solve_ivp_discrete(model,x0,switches,tf,t_plot):
     nx = x0.size
-    start = [x0[i] for i in range(nx)]
+    if nx > 1:
+        start = [x0[i] for i in range(nx)]
+    else:
+        start = [x0]
 
 
-    tau_IDLE_all, tau_MELT_all = derive_regimes(switches,tf,1)
+    tau_MELT_all, tau_IDLE_all  = derive_regimes(switches,tf,1)
     switches_ext = np.append(np.insert(switches,0,0),tf)
 
     T = np.array([])
@@ -200,7 +192,7 @@ def solve_ivp_discrete(model,x0,switches,tf,t_plot):
     return(t,y)
 
 def sol_ivp_wrapper(model,x0,switches,tf,t_plot):
-    tau_IDLE_all, tau_MELT_all = derive_regimes(switches,tf,1)
+    tau_MELT_all, tau_IDLE_all  = derive_regimes(switches,tf,1)
     x0 = [x0[i] for i in range(len(x0))]
     
     sol = solve_ivp(model.f, [0, tf], x0, args=(tau_MELT_all,tau_IDLE_all),t_eval = t_plot)
@@ -210,9 +202,26 @@ def sol_ivp_wrapper(model,x0,switches,tf,t_plot):
     T = sol.t
     return np.squeeze(T), np.squeeze(X), np.squeeze(Z)
 
+def derive_regimes(switches,tf,endpoints):
+    n_switches = switches.size
+    n_cycles = int(n_switches/2)
+    tau_MELT = switches[np.arange(0,n_switches,2)]
+    tau_IDLE = switches[np.arange(1,n_switches,2)]
+    
+    if endpoints:
+        tau_IDLE = np.insert(tau_IDLE,0,0)
+        tau_MELT = np.append(tau_MELT,tf)
+    
+    return tau_MELT, tau_IDLE 
+
+def mergeSwitchCont(switches):
+    n_s = int(len(switches)/2)
+    melt = switches[:n_s]
+    idle = switches[n_s:]
+    return(np.insert(idle, np.arange(len(melt)), melt))
 
 # ENERGY COST
-def smooth_dap(dap,t):
+def smooth_dap(t,dap):
     dat = 60 * np.arange(dap.size + 1); dat[0] = dat[0] - 60; dat[-1] = dat[-1] + 60
     
     _dap = 0
@@ -223,7 +232,8 @@ def smooth_dap(dap,t):
 
 
 def smooth_regime(T,switches):
-    tau_IDLE, tau_MELT = derive_regimes(switches,T[-1],0)
+    n_s = int(len(switches)/2)
+    tau_MELT, tau_IDLE  = switches[:n_s] , switches[n_s:] #derive_regimes(switches,T[-1],0)
     regime = 0
     for k in range(len(tau_MELT)):
             regime += 1/ ((1 + np.exp(np.minimum(-1. * (T - tau_MELT[k]), 15.0 ))) *
@@ -237,8 +247,8 @@ def cost(traj,T,switches,dap,k,k_MELT,k_IDLE):
     
     dt = np.diff(T)
     regime = smooth_regime(T,switches)
-    _dap = smooth_dap(dap,T)
-    cost_momental = _dap * (k * traj + k_IDLE * (regime <= 0.5) + k_MELT * (regime > 0.5))
+    _dap = smooth_dap(T,dap)
+    cost_momental = _dap * (k * traj + k_IDLE * (regime <= 0.5) + k_MELT * (regime > 0.5)) * 1/60 # 1/60 to Compensate for unit change
     cost_acc = np.cumsum(cost_momental[1:] * dt)
 
     #plt.plot(cost_momental)
