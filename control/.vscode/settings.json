@@ -1,0 +1,7 @@
+{
+    "cmake.configureOnOpen": false,
+    "files.associations": {
+        "switching-times-ice-tank-2ndorder": "cpp",
+        "filesystem": "cpp"
+    }
+}

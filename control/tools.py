@@ -1,10 +1,57 @@
 import numpy as np
+import scipy
 from scipy.integrate import solve_ivp
+
+# Expand f to also compute the consumptions
+def f_with_consumption(t,x,switches,model,price,k_baseline,k_IDLE,k_MELT):
+    
+    # first nx-2 values is the state of the process
+    # -2 value is the total power consumption
+    # -1 is the total cost
+    
+    model_regime = smooth_regime(t,switches,1.)
+
+    nx = x.size
+    x_no_cost = x[:-1]
+    dxdt_no_cost = model.f(t,x_no_cost,switches)
+    dxdt = np.zeros(len(dxdt_no_cost)+1)
+
+    # Normal process
+    for i in range(nx-1):
+        dxdt[i] = dxdt_no_cost[i]
+
+    # Consumption
+    dxdt[nx-1] = (k_baseline * model.h(x_no_cost) +  model_regime * k_MELT + (1-model_regime) * k_IDLE) * 1./60;   
+    return(dxdt)
+
+# Expand f to also compute the cost
+def f_with_cost(t,x,switches,model,price,k_baseline,k_IDLE,k_MELT):
+    
+    # first nx-2 values is the state of the process
+    # -2 value is the total power consumption
+    # -1 is the total cost
+    _price = smooth_dap(t,price)
+    model_regime = smooth_regime(t,switches,1.)
+
+    nx = x.size
+    x_no_cost = x[:-2]
+    dxdt_no_cost = model.f(t,x_no_cost,switches)
+    dxdt = np.zeros(len(dxdt_no_cost)+2)
+
+    # Normal process
+    for i in range(nx-2):
+        dxdt[i] = dxdt_no_cost[i]
+
+    # Consumption
+    dxdt[nx-2] = (k_baseline * model.h(x_no_cost) +  model_regime * k_MELT + (1-model_regime) * k_IDLE) * 1./60;
+    # Cost
+    dxdt[nx-1] = _price * (k_baseline * model.h(x_no_cost) +  model_regime * k_MELT + (1-model_regime) * k_IDLE) * 1./60.;   
+    return(dxdt)
 
 def stochasticSimulation(model,switches,x0,tf,dt):
     
     # Compute regimes
-    tau_MELT_all, tau_IDLE_all = derive_regimes(switches,tf,1)
+    #tau_MELT_all, tau_IDLE_all = derive_regimes(switches,tf,1)
     
     # Model functions
     f = model.f
@@ -14,6 +61,8 @@ def stochasticSimulation(model,switches,x0,tf,dt):
     
     # Initialize vairables
     x = x0
+    print(tf)
+    print(dt)
     N = int(tf/dt)
     nx = x.size
     nz = h(x).size
@@ -32,7 +81,7 @@ def stochasticSimulation(model,switches,x0,tf,dt):
     # Run simulation
     t = 0
     for k in range(N):
-        dx = f(t,x,tau_MELT_all,tau_IDLE_all)
+        dx = f(t,x,switches)
         dw = sigma * dW[k]
 
         x = x + dx * dt + dw
@@ -45,12 +94,20 @@ def stochasticSimulation(model,switches,x0,tf,dt):
         Y[:,k] = z + v[k]
         T[k] = t
         
-    return np.squeeze(T), np.squeeze(X), np.squeeze(Y), np.squeeze(Z)
+    return np.squeeze(T), X, Y, Z
 
 
-def simulate_MPC(model,x0,n_days,nswitches,prices,k,k_MELT,k_IDLE,dt,start_date,seed,save_to_file):   
+def simulate_MPC(system_true,system_model,tank,
+                 x0_true,x0_model,n_days,prices,k,k_MELT,k_IDLE,dt,
+                 start_date,seed,save_to_file):   
+    
     np.random.seed(seed)
+    
+    n_s = int(len(tank.get_p_optimize())/2)
+    print(n_s)
 
+    start_true = x0_true
+    start_model = x0_model
     # Simulate parameters
     #n_days = 30
     #dt = 0.01
@@ -58,62 +115,88 @@ def simulate_MPC(model,x0,n_days,nswitches,prices,k,k_MELT,k_IDLE,dt,start_date,
 
     # Initialize process
     #x0 = np.array([2.6659426, 899.8884004])
-    nx = x0.shape[0]
+    nx_true = start_true.shape[0]
+    nx_model = start_true.shape[0]
     
     tf_ph = 48 * 60
     tf_sim = 24 * 60
+    dt = 0.01
 
     # Initialzie history
     history = {}
-    history['X'] = np.zeros([n_days, nx, 60 * 24])
-    history['Z'] = np.zeros([n_days, 60 * 24])
-    history['Z_ode'] = np.zeros([n_days, 60 * 24])
+    history['X_true'] = np.zeros([n_days, nx_true, 60 * 24])
+    history['X_model'] = np.zeros([n_days, nx_model, 60 * 24])
+    history['Z_true'] = np.zeros([n_days, 1, 60 * 24])
+    history['Z_model'] = np.zeros([n_days, 1, 60 * 24])
     history['T'] = np.zeros([n_days, 60 * 24])
 
-    history['SWITCHES'] = np.zeros([n_days, nswitches])
+    history['SWITCHES'] = np.zeros([n_days, 2 * n_s])
     history['PRICES'] = np.zeros([n_days, 48])
 
-    history['expected_price'] = np.zeros(n_days)
-    history['true_price'] = np.zeros(n_days)
+    history['price_model'] = np.zeros(n_days)
+    history['price_true'] = np.zeros(n_days)
 
 
     idx_offset = np.where(prices.index == start_date)[0][0]
     for day in range(n_days):
-        print('Simulating day ' + str(day))
+        #print(' --- Simulating day ' + str(day), end = '')
+        print('  ----- Simulating day ' + str(day) + ' ----  ')
 
         # Extract variables related to the day
         idx = np.arange(48) + day * 48 + idx_offset
         future_days = np.array(prices.index[idx])
-        future_hours = np.array(prices['Hours'][idx])
-        future_price = np.array(prices['DK1'][idx]).astype(np.float)
+        #future_hours = np.array(prices['Hours'][idx])
+        future_price = np.array(prices['spot'][idx]).astype(np.float) * 1/1000000
 
 
         # ---------------------------
         # Compute optimal switches over 2 days
         # ---------------------------
+        
+        # -- Set new optimization object
+        
+        # Initial state of the system
+        tank.set_x0(np.append(start_model,0)) 
+        
+        # Update prices
+        p_dynamic = tank.get_p_dynamic()
+        for k in range(0, 48):
+            p_dynamic[k] = future_price[k]
+        tank.set_p_dynamic(p_dynamic)
+
+        
+        # -- Solve the problem - Uncommented until number of iterations is fixed
+        print(' ... Optimizing')
+        tank.solve()
+        switch_opt = np.array(tank.get_p_optimize_ipopt())
+        
 
         # To be changed to C++ optimizer
-        switch_opt = np.sort(np.random.uniform(0,tf_ph,nswitches))
+        #switch_opt = np.sort(np.random.uniform(0,tf_ph,2*n_s))
+        #switch_opt = np.concatenate(derive_regimes(switch_opt,0,0))
 
 
         # ---------------------------
         # Simulate 1 day
         # ---------------------------
-        switch_sim = switch_opt
-        #nswicthes_switches_in_ph = np.sum(switch_opt < tf_sim) + np.sum(switch_opt < tf_sim) % 2
-        #switch_sim = switch_opt[switch_opt < tf_sim]
+        switch_sim = switch_opt # Could be corrupted by delay is in reality
 
         # Consider only saving every 1 minutes of the simulation
-        T_tmp, X_tmp, Y_tmp, Z_tmp = stochasticSimulation(model,switch_sim,x0,tf_sim,dt)
-        T_tmp_ode, X_tmp_ode, Z_tmp_ode = solve_ivp_discrete(model,x0,switch_sim,tf_sim,T_tmp)
+        print(' ... Simulating true process')
+        T_tmp, X_tmp, Y_tmp, Z_tmp = stochasticSimulation(system_true,switch_sim,start_true,tf_sim,dt)
+        #T_tmp = np.linspace(0,tf_sim,1000)
+        
+        print(' ... Simulating model process')
+        T_tmp_ode, X_tmp_ode, Z_tmp_ode = sol_ivp_wrapper_discrete(system_model,start_model,switch_sim,tf_sim,T_tmp)
+        #T_tmp_ode, X_tmp_ode, Z_tmp_ode =  sol_ivp_wrapper(system_model,start_model,switch_sim,tf_sim,T_tmp)
 
 
         # ---------------------------
         # Compute Cost
         # ---------------------------
-        dap = 1/1000000 * future_price[:24]
-        cost_true, cost_acc_true = cost(Z_tmp,T_tmp,switch_sim,dap,k,k_MELT,k_IDLE)
-        cost_exp, cost_acc_exp = cost(Z_tmp_ode,T_tmp_ode,switch_sim,dap,k,k_MELT,k_IDLE)
+        dap = future_price[:24]
+        cost_true, cost_acc_true = cost(Z_tmp[0],T_tmp,switch_sim,dap,k,k_MELT,k_IDLE)
+        cost_model, cost_acc_model = cost(Z_tmp_ode[0],T_tmp_ode,switch_sim,dap,k,k_MELT,k_IDLE)
 
 
 
@@ -122,15 +205,23 @@ def simulate_MPC(model,x0,n_days,nswitches,prices,k,k_MELT,k_IDLE,dt,start_date,
         # ---------------------------
 
         # Process
-        x0 = np.array([X_tmp[i][-1] for i in range(nx)])
+        #if nx > 1:
+        #    start = X_tmp[i][-1] for i in range(nx)]
+        #else:
+        #    start = X_tmp[-1]
+        #x0 = np.array([X_tmp[i][-1] for i in range(nx)])
+        start_true = X_tmp[:,-1]
+        start_model = X_tmp_ode[:,-1] # Should be estimated with Kalman filter.
 
+        
         # Update monitored variables
-        history['expected_price'][day] = cost_true[-1]
-        history['true_price'][day] = cost_exp[-1]
+        history['price_true'][day] = cost_true[-1]
+        history['price_model'][day] = cost_model[-1]
 
-        history['Z'][day] = Z_tmp[::int(1/dt)]
-        history['Z_ode'][day] = Z_tmp_ode[::int(1/dt)]
-        history['X'][day,:] = X_tmp[:,::int(1/dt)]
+        history['Z_true'][day] = Z_tmp[:,::int(1/dt)]
+        history['Z_model'][day] = Z_tmp_ode[:,::int(1/dt)]
+        history['X_true'][day,:] = X_tmp[:,::int(1/dt)]
+        history['X_model'][day,:] = X_tmp_ode[:,::int(1/dt)]
         history['T'][day] = T_tmp[::int(1/dt)] # Same in each day
         history['SWITCHES'][day,:] = switch_opt
         history['PRICES'][day,:] = future_price
@@ -143,64 +234,104 @@ def simulate_MPC(model,x0,n_days,nswitches,prices,k,k_MELT,k_IDLE,dt,start_date,
 
 
 
-def solve_ivp_discrete(model,x0,switches,tf,t_plot):
+def discrete_ivp_solver(f,x0,switch,T,tf,extra_args=()): 
+    # Notice that the very last value in T is not evaluated
+    
+    # Extract eventual extra arguments to f
+    args = (switch,) + extra_args
+    
+    # There must not be duplicates in switches
     nx = x0.size
-    if nx > 1:
-        start = [x0[i] for i in range(nx)]
+    T_out = np.array([T[0]])
+    X_out = np.expand_dims(x0, axis=1) #np.zeros((nx,1))
+  
+
+
+    # Find initial regime
+    t0_subint = T[0]
+    if smooth_regime(t0_subint,switch,2000000.) > 0.5:
+        current_state = 1
     else:
-        start = [x0]
+        current_state = 0
+
+    # Derive the melt and idle starts
+    n_s = int(len(switch)/2)
+    tau_MELT_all = np.append(switch[:int(n_s)],tf)
+    tau_IDLE_all = np.insert(switch[int(n_s):],0,0)
 
 
-    tau_MELT_all, tau_IDLE_all  = derive_regimes(switches,tf,1)
-    switches_ext = np.append(np.insert(switches,0,0),tf)
+    x0_subint = x0
+    tf_subint = T[-2] # Dummy value
+    
+    while (tf_subint < T[-1]):
 
-    T = np.array([])
-    X = np.zeros((nx,1))
-
-
-    # Loop through all regimes
-    for i in range(len(switches_ext)-1):
-
-
-        if (t_plot is None): 
-
-            t_eval = None
+        if current_state == 1:
+            tf_subint = tau_IDLE_all[t0_subint < tau_MELT_all][0]
         else:
-
-            t_eval = t_plot[ (switches_ext[i] <= t_plot) & (t_plot < switches_ext[i+1])]
-            if (len(t_eval) != 0):
-
-                sol = solve_ivp(model.f, 
-                        [switches_ext[i], 
-                         switches_ext[i+1]], 
-                        start, 
-                        args=(tau_MELT_all,tau_IDLE_all), 
-                        t_eval = t_eval)
-
-                T = np.concatenate((T,sol.t))
-                X = np.hstack([X,sol.y])
+            tf_subint = tau_MELT_all[t0_subint >= tau_IDLE_all][-1]
+            
+        #print(t0_subint, tf_subint)
 
 
-                start = [sol.y[j][-1] for j in range(nx) ]
+        # Derive t_eval
+        #print('Tsize', T.size)
+        T_subint = T[(t0_subint < T) & (T <= tf_subint)]
+        #print(T_subint.size)
+        if len(T_subint) > 0:
+            #print('Tsubsize',T_subint.size)
+            # Solve in the interval anf save
+            #print(args)
+            sol = solve_ivp(f, [t0_subint, T_subint[-1]], x0_subint, args=args, t_eval = T_subint)
+            #print(sol.t.size)
+            #print(X_out)
+            #print(X_out.shape)
+            #print(sol.y)
+            #print(sol.y.shape)
+            T_out = np.hstack((T_out,sol.t))
+            X_out = np.hstack([X_out,sol.y])
+
+            # Update x only if an iteragration was executed
+            x0_subint = np.array([sol.y[j][-1] for j in range(nx) ])
+            
+        else:
+            # Make sure to keep integration though we do not want to return any points in the region
+            sol = solve_ivp(f, [t0_subint, tf_subint], x0_subint, args=args, t_eval = np.expand_dims(tf_subint, axis=0))
+
+            # Update x only if an iteragration was executed
+            x0_subint = np.array([sol.y[j][-1] for j in range(nx) ])
+
+        # Update status of the system
+        current_state = 1 - current_state
+        t0_subint = tf_subint
+        
+    # Evaluate end point
+    #sol = solve_ivp(f, [tf-1, tf], x0_subint, args=args, t_eval = np.array(tf))
+    #T_out = np.concatenate((T_out, sol.t))
+    #X_out = np.hstack([X_out,sol.y])
+
+    
+    # Restructure solution
+    #X_out = np.array([X_out[i][1:] for i in range(nx)])
+    #Z_out = model.h(X_out)
+    
+    return T, X_out #, Z_out
 
 
-    X = np.array([X[i][1:] for i in range(nx)])
+def sol_ivp_wrapper_discrete(model,x0,switches,tf,T):
+    T, X = discrete_ivp_solver(model.f,x0,switches,T,tf)
+    
     Z = model.h(X)
-    
-    return np.squeeze(T), np.squeeze(X), np.squeeze(Z)
-    
-    return(t,y)
+    return T, X, Z
 
 def sol_ivp_wrapper(model,x0,switches,tf,t_plot):
-    tau_MELT_all, tau_IDLE_all  = derive_regimes(switches,tf,1)
     x0 = [x0[i] for i in range(len(x0))]
     
-    sol = solve_ivp(model.f, [0, tf], x0, args=(tau_MELT_all,tau_IDLE_all),t_eval = t_plot)
+    sol = solve_ivp(model.f, [0, tf], x0, args=(switches,),t_eval = t_plot)
     
     X = sol.y
     Z = model.h(X)
     T = sol.t
-    return np.squeeze(T), np.squeeze(X), np.squeeze(Z)
+    return np.squeeze(T), X, Z
 
 def derive_regimes(switches,tf,endpoints):
     n_switches = switches.size
@@ -225,19 +356,19 @@ def smooth_dap(t,dap):
     dat = 60 * np.arange(dap.size + 1); dat[0] = dat[0] - 60; dat[-1] = dat[-1] + 60
     
     _dap = 0
-    for k in range(24):
+    for k in range(dap.size):
             _dap += dap[k] / ((1. + np.exp(np.minimum(-1 * (t - dat[k]), 15.0 ))) *
                              (1. + np.exp( np.minimum(1. * (t - dat[k + 1]), 15.))))
     return _dap
 
 
-def smooth_regime(T,switches):
+def smooth_regime(T,switches,slope):
     n_s = int(len(switches)/2)
     tau_MELT, tau_IDLE  = switches[:n_s] , switches[n_s:] #derive_regimes(switches,T[-1],0)
     regime = 0
     for k in range(len(tau_MELT)):
-            regime += 1/ ((1 + np.exp(np.minimum(-1. * (T - tau_MELT[k]), 15.0 ))) *
-                             (1 + np.exp( np.minimum(1. * (T - tau_IDLE[k]), 15.))))
+            regime += 1/ ((1 + np.exp(np.minimum(-slope * (T - tau_MELT[k]), 15.0 ))) *
+                             (1 + np.exp( np.minimum(slope * (T - tau_IDLE[k]), 15.))))
             
     return regime
 
@@ -246,7 +377,7 @@ def cost(traj,T,switches,dap,k,k_MELT,k_IDLE):
     
     
     dt = np.diff(T)
-    regime = smooth_regime(T,switches)
+    regime = smooth_regime(T,switches,1.)
     _dap = smooth_dap(T,dap)
     cost_momental = _dap * (k * traj + k_IDLE * (regime <= 0.5) + k_MELT * (regime > 0.5)) * 1/60 # 1/60 to Compensate for unit change
     cost_acc = np.cumsum(cost_momental[1:] * dt)
@@ -258,3 +389,179 @@ def cost(traj,T,switches,dap,k,k_MELT,k_IDLE):
 # MATH
 def sigmoid(x,slope,offset):
     return 1./(1. + np.exp(-(slope * (x - offset))))
+
+def plotSwitches(switches,c1,c2,ax):
+    n_s = int(len(switches)/2)
+    for xc in switches[:n_s]:
+        ax.axvline(x=xc,color = c1, alpha = 0.2)
+    
+    for xc in switches[n_s:]:
+        ax.axvline(x=xc,color = c2, alpha = 0.2)
+
+
+def build_initial_ipopt_object(tank, tank_pars, dt, k, k_MELT, k_IDLE, t0, tf_ph, max_melt, n_s, opt_rk):
+    
+    #p_x0 = np.append(x0,0)
+    p_const = np.concatenate((tank_pars, np.array([k, k_MELT, k_IDLE])))
+
+    p_dynamic = np.zeros(48 + 49) # day-ahead prices and day-ahead times -> vary in each new optimization -> therefore dynamic
+    for k in range(0, 48):
+        p_dynamic[k] = -1 #future_price[k] * 1/1000000 Price noit set untill MPC loop
+    for k in range(0, 49):
+        p_dynamic[48 + k] = k * 60.
+
+    if opt_rk:
+        n_bounds = 4 * n_s
+    else:
+        n_bounds = 2 * n_s
+
+    lower_bound = np.zeros(n_bounds) # lower bounds for optimization variables
+    upper_bound = np.zeros(n_bounds) # upper bounds for optimization variables
+    on_bound = np.array([0., tf_ph, max_melt])
+    off_bound = np.array([0., tf_ph])
+    for k in range(0, n_bounds):
+        lower_bound[k], upper_bound[k] = t0, tf_ph
+
+
+    # Build initial values - Other methods could be considered
+    #idle = tf_ph * np.linspace(0.1,0.9,n_s) # Spread out on the whole interval
+    #melt = idle - max_melt/n_s * 0.9 # Assign melt period to a little before idle
+    #p_optimize = np.concatenate((melt,idle)) # put together
+
+    tank.set_p_const(p_const)
+    tank.set_p_dynamic(p_dynamic)
+    #tank.set_p_optimize(p_optimize)
+    tank.set_t0(t0)
+    tank.set_tf(tf_ph)
+    tank.set_dt(dt)
+    #tank.set_x0(p_x0)
+    tank.set_lower_bound(lower_bound)
+    tank.set_upper_bound(upper_bound)
+    tank.set_on_bound(on_bound)
+    tank.set_off_bound(off_bound)
+    
+    return tank
+
+def consMatrix(n_s,tf,max_melt):
+    # Consider to rebuild since t0 > 0 and tN < tf is implciit since all variables must be greater than 0 and less than tf
+    #nswitch = len(tau)
+    n_s_all = 2*n_s
+    A = np.zeros((n_s_all+2,n_s_all))
+    A[:n_s_all,:n_s_all] += + -1 * np.eye(n_s_all)
+    A[:n_s,n_s:] += + np.eye(n_s)
+    A[(n_s+1):(n_s_all+1),:n_s] += np.eye(n_s)
+    A[-1,:] = np.concatenate((np.ones(n_s),-1 * np.ones(n_s)))
+    
+    A = np.hstack((A[:,n_s:],A[:,:n_s])) # Let [tau_idle , tau_melt]' become [tau_melt, tau_idle]' 
+    
+    ub = np.zeros(n_s_all + 2)
+    ub[-2] = tf
+    ub[-1] = max_melt
+    
+    return(A,ub)
+
+
+def constraintASparse(n_s):
+
+    row = np.zeros( 2 * 6 * n_s - 2 )
+    col = np.zeros( 2 * 6 * n_s - 2 )
+    val = np.zeros( 2 * 6 * n_s - 2 )
+
+    # Build coordinates
+
+    # Block 1
+    index = 0
+    for k in range(n_s):
+        row[index] = k; col[index] = k;
+        index += 1
+
+        row[index] = k; col[index] = n_s + k;
+        index += 1
+
+    for k in range(n_s-1):
+        row[index] = n_s + k; col[index] = 1 + k;
+        index += 1
+
+        row[index] = n_s + k; col[index] = n_s + k;
+        index += 1
+
+    for k in range(n_s):
+        row[index] = 2*n_s-1; col[index] = k;
+        index += 1
+
+        row[index] = 2*n_s-1; col[index] = n_s + k;
+        index += 1
+
+    # Block 2
+    for k in range(n_s):
+        row[index] = 2*n_s + k; col[index] = 2*n_s + k;
+        index += 1
+
+        row[index] = 2*n_s + k; col[index] = 2*n_s + n_s + k;
+        index += 1
+
+    for k in range(n_s-1):
+        row[index] = 2*n_s + n_s + k; col[index] = 2*n_s + 1 + k;
+        index += 1
+
+        row[index] = 2*n_s + n_s + k; col[index] = 2*n_s + n_s + k;
+        index += 1
+
+    for k in range(n_s):
+        row[index] = 2*n_s + 2*n_s-1; col[index] = 2*n_s + k;
+        index += 1
+
+        row[index] = 2*n_s + 2*n_s-1; col[index] = 2*n_s + n_s + k;
+        index += 1
+
+
+    # Insert values
+
+    # Block 1
+    index = 0
+    for k in range(n_s):
+        val[index] = 1
+        index += 1
+
+        val[index] = -1
+        index += 1
+
+    for k in range(n_s-1):
+        val[index] = -1
+        index += 1
+
+        val[index] = 1
+        index += 1
+
+    for k in range(n_s):
+        val[index] = -1
+        index += 1
+
+        val[index] = 1
+        index += 1
+
+    # Block 2
+    for k in range(n_s):
+        val[index] = 1
+        index += 1
+
+        val[index] = -1
+        index += 1
+
+    for k in range(n_s-1):
+        val[index] = -1
+        index += 1
+
+        val[index] = 1
+        index += 1
+
+    for k in range(n_s):
+        val[index] = -1
+        index += 1
+
+        val[index] = 1
+        index += 1
+
+    A = scipy.sparse.coo_matrix((val, (row, col)), shape=(2 * 2*n_s, 2 * 2*n_s))
+    
+    return A
